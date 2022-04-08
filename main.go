@@ -69,6 +69,7 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 		if err != nil {
 			break
 		}
+
 		message = append(message, '\n')
 		if _, err = w.Write(message); err != nil {
 			break
@@ -111,7 +112,9 @@ func internalError(ws *websocket.Conn, err error) {
 	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 }
 
-var upgrader = websocket.Upgrader{}
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
+	return true
+}}
 
 func serveWs(w http.ResponseWriter, r *http.Request) {
 	podName := r.FormValue("podName")
@@ -170,7 +173,6 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		dLog.Info("stream end, error: ", err)
 		streamDone = true
 		_ = outr.Close() // 关闭使 pumpStdout 停止
-		//_ = inw.Close()  // 关闭使 pumpStdin 停止
 	}()
 
 	stdoutDone := make(chan struct{})
@@ -185,7 +187,7 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		_, _ = inw.Write([]byte("exit\n"))
-		<-time.After(time.Second * 2)
+		<-time.After(time.Second)
 	}
 	if !streamDone {
 		dLog.Error("stream did not exit successfully")
@@ -214,7 +216,7 @@ func init() {
 }
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "http service address")
+	addr := flag.String("addr", "127.0.0.1:8081", "http service address")
 	flag.Parse()
 
 	http.HandleFunc("/", serveHome)
