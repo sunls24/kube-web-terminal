@@ -12,13 +12,14 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
+	"kube-web-terminal/term"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 )
 
-func kubeCommand(in io.Reader, out io.Writer, command []string, podName, namespace, container string) (func() error, error) {
+func kubeCommand(in io.Reader, out io.Writer, command []string, podName, namespace, container string, quit <-chan struct{}) (func() error, error) {
 	config, err := clientcmd.BuildConfigFromFlags("", "/home/sunls/.kube/config")
 	if err != nil {
 		return nil, errors.Wrap(err, "build kube config")
@@ -27,6 +28,8 @@ func kubeCommand(in io.Reader, out io.Writer, command []string, podName, namespa
 	if err != nil {
 		return nil, errors.Wrap(err, "new client by kube config")
 	}
+	tty := term.TTY{In: in, Out: out, Raw: true}
+	//tty.Raw = tty.IsTerminalIn()
 	req := client.CoreV1().RESTClient().Post().Resource("pods").
 		Name(podName).Namespace(namespace).SubResource("exec").
 		VersionedParams(&corev1.PodExecOptions{
@@ -35,14 +38,16 @@ func kubeCommand(in io.Reader, out io.Writer, command []string, podName, namespa
 			Stdin:     true,
 			Stderr:    true,
 			Stdout:    true,
-			TTY:       true}, scheme.ParameterCodec)
+			TTY:       tty.Raw}, scheme.ParameterCodec)
 	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
 		return nil, errors.Wrap(err, "NewSPDYExecutor")
 	}
 
 	return func() error {
-		return exec.Stream(remotecommand.StreamOptions{Stdout: out, Stderr: out, Stdin: in, Tty: true})
+		return tty.Safe(func() error {
+			return exec.Stream(remotecommand.StreamOptions{Stdout: out, Stderr: out, Stdin: in, Tty: tty.Raw})
+		}, quit)
 	}, nil
 }
 
@@ -70,14 +75,13 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 			break
 		}
 
-		message = append(message, '\n')
 		if _, err = w.Write(message); err != nil {
 			break
 		}
 	}
 }
 
-func pumpStdout(ws *websocket.Conn, r io.Reader, done chan struct{}) {
+func pumpStdout(ws *websocket.Conn, r io.Reader) {
 	s := bufio.NewScanner(r)
 	for s.Scan() {
 		_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
@@ -88,10 +92,9 @@ func pumpStdout(ws *websocket.Conn, r io.Reader, done chan struct{}) {
 
 	_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
 	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	close(done)
 }
 
-func ping(ws *websocket.Conn, done chan struct{}) {
+func ping(ws *websocket.Conn, quit chan struct{}) {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	for {
@@ -100,7 +103,7 @@ func ping(ws *websocket.Conn, done chan struct{}) {
 			if err := ws.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeWait)); err != nil {
 				log.Error(errors.Wrap(err, "ping"))
 			}
-		case <-done:
+		case <-quit:
 			return
 		}
 	}
@@ -112,9 +115,7 @@ func internalError(ws *websocket.Conn, err error) {
 	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
-	return true
-}}
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func serveWs(w http.ResponseWriter, r *http.Request) {
 	podName := r.FormValue("podName")
@@ -159,7 +160,8 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	defer inr.Close()
 	defer inw.Close()
 
-	stream, err := kubeCommand(inr, outw, []string{command}, podName, namespace, container)
+	quit := make(chan struct{})
+	stream, err := kubeCommand(inr, outw, []string{command}, podName, namespace, container, quit)
 	if err != nil {
 		internalError(ws, errors.Wrap(err, "kube command"))
 		return
@@ -175,17 +177,19 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		_ = outr.Close() // 关闭使 pumpStdout 停止
 	}()
 
-	stdoutDone := make(chan struct{})
-	go pumpStdout(ws, outr, stdoutDone)
-	go ping(ws, stdoutDone)
+	go pumpStdout(ws, outr)
+	go ping(ws, quit)
 
 	// ws 连接进行中会在此处堵塞
 	pumpStdin(ws, inw)
+
+	close(quit)
 
 	for i := 0; i < 5; i++ {
 		if streamDone {
 			break
 		}
+		// 尝试退出 shell
 		_, _ = inw.Write([]byte("exit\n"))
 		<-time.After(time.Second)
 	}
@@ -216,7 +220,7 @@ func init() {
 }
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8081", "http service address")
+	addr := flag.String("addr", ":8081", "http service address")
 	flag.Parse()
 
 	http.HandleFunc("/", serveHome)
