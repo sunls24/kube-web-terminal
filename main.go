@@ -1,54 +1,27 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
 	"flag"
+	"fmt"
+	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"io"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/tools/remotecommand"
-	"kube-web-terminal/term"
+	command "kube-web-terminal/command"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 )
 
-func kubeCommand(in io.Reader, out io.Writer, command []string, podName, namespace, container string, quit <-chan struct{}) (func() error, error) {
-	config, err := clientcmd.BuildConfigFromFlags("", "/home/sunls/.kube/config")
-	if err != nil {
-		return nil, errors.Wrap(err, "build kube config")
-	}
-	client, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, errors.Wrap(err, "new client by kube config")
-	}
-	tty := term.TTY{In: in, Out: out, Raw: true}
-	//tty.Raw = tty.IsTerminalIn()
-	req := client.CoreV1().RESTClient().Post().Resource("pods").
-		Name(podName).Namespace(namespace).SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdin:     true,
-			Stderr:    true,
-			Stdout:    true,
-			TTY:       tty.Raw}, scheme.ParameterCodec)
-	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
-	if err != nil {
-		return nil, errors.Wrap(err, "NewSPDYExecutor")
-	}
-
-	return func() error {
-		return tty.Safe(func() error {
-			return exec.Stream(remotecommand.StreamOptions{Stdout: out, Stderr: out, Stdin: in, Tty: tty.Raw})
-		}, quit)
-	}, nil
+func init() {
+	// 日志打印格式
+	format := new(log.TextFormatter)
+	format.FullTimestamp = true
+	format.TimestampFormat = "06-01-02 15:04:05"
+	log.SetFormatter(format)
 }
 
 const (
@@ -65,6 +38,11 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 )
 
+const (
+	msgCommand = '0'
+	msgResize  = '1'
+)
+
 func pumpStdin(ws *websocket.Conn, w io.Writer) {
 	ws.SetReadLimit(maxMessageSize)
 	_ = ws.SetReadDeadline(time.Now().Add(pongWait))
@@ -74,6 +52,33 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 		if err != nil {
 			break
 		}
+		switch message[0] {
+		case msgCommand:
+			message = message[1:]
+		case msgResize:
+			s := &command.Size{}
+			err = json.Unmarshal(message[1:], s)
+			if err != nil {
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: json.Unmarshal: %v", err)))
+				continue
+			}
+
+			ptyRW := w.(*os.File)
+			size, err := pty.GetsizeFull(ptyRW)
+			if err != nil {
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: GetsizeFull: %v", err)))
+			}
+			size.Rows = s.Rows
+			size.Cols = s.Cols
+			err = pty.Setsize(ptyRW, size)
+			if err != nil {
+				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: Setsize: %v", err)))
+			}
+			fmt.Println("resize done")
+			continue
+		default:
+			continue
+		}
 
 		if _, err = w.Write(message); err != nil {
 			break
@@ -82,10 +87,14 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 }
 
 func pumpStdout(ws *websocket.Conn, r io.Reader) {
-	s := bufio.NewScanner(r)
-	for s.Scan() {
+	buff := make([]byte, 1024)
+	for {
+		n, err := r.Read(buff)
+		if err != nil {
+			break
+		}
 		_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-		if err := ws.WriteMessage(websocket.TextMessage, s.Bytes()); err != nil {
+		if err := ws.WriteMessage(websocket.TextMessage, buff[:n]); err != nil {
 			break
 		}
 	}
@@ -115,17 +124,21 @@ func internalError(ws *websocket.Conn, err error) {
 	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 }
 
+func resize(ptyRW *os.File, cols, rows int) error {
+	return pty.Setsize(ptyRW, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func serveWs(w http.ResponseWriter, r *http.Request) {
 	podName := r.FormValue("podName")
 	namespace := r.FormValue("namespace")
 	container := r.FormValue("container")
-	command := r.FormValue("command")
-	if len(command) == 0 {
-		command = "sh"
+	sh := r.FormValue("command")
+	if len(sh) == 0 {
+		sh = "sh"
 	}
-	if !strings.Contains(command, "sh") {
+	if !strings.Contains(sh, "sh") {
 		log.Error("command needs to be an sh-like command")
 		return
 	}
@@ -141,61 +154,58 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	dLog := log.WithField("podName", podName).WithField("namespace", namespace).WithField("container", container).WithField("command", command)
+	dLog := log.WithField("podName", podName).WithField("namespace", namespace).WithField("container", container).WithField("command", sh)
 	dLog.Info("start ws connect")
 
-	outr, outw, err := os.Pipe()
+	// websocket读写pty，exec程序读写tty
+	ptyRW, ttyRW, err := pty.Open()
 	if err != nil {
-		internalError(ws, errors.Wrap(err, "pipe stdout"))
+		internalError(ws, errors.Wrap(err, "pty.Open"))
 		return
 	}
-	defer outr.Close()
-	defer outw.Close()
+	defer ttyRW.Close()
+	defer ptyRW.Close()
 
-	inr, inw, err := os.Pipe()
-	if err != nil {
-		internalError(ws, errors.Wrap(err, "pipe stdin"))
-		return
-	}
-	defer inr.Close()
-	defer inw.Close()
+	_ = pty.Setsize(ptyRW, &pty.Winsize{Cols: 35, Rows: 24})
 
-	quit := make(chan struct{})
-	stream, err := kubeCommand(inr, outw, []string{command}, podName, namespace, container, quit)
+	cmd, err := command.NewCommand(ttyRW, []string{sh}, podName, namespace, container)
 	if err != nil {
-		internalError(ws, errors.Wrap(err, "kube command"))
+		internalError(ws, errors.Wrap(err, "NewCommand"))
 		return
 	}
 
 	// stream 和 ws 有任意一个中断或结束，需要通知对方停止
+	quit := make(chan struct{})
 	var streamDone bool
 	go func() {
 		dLog.Info("stream start")
-		err := stream()
+		err := cmd.Stream(quit)
 		dLog.Info("stream end, error: ", err)
 		streamDone = true
-		_ = outr.Close() // 关闭使 pumpStdout 停止
+		_ = ptyRW.Close() // 关闭使 pumpStdout 停止
 	}()
 
-	go pumpStdout(ws, outr)
+	go pumpStdout(ws, ptyRW)
 	go ping(ws, quit)
 
 	// ws 连接进行中会在此处堵塞
-	pumpStdin(ws, inw)
+	pumpStdin(ws, ptyRW)
 
 	close(quit)
 
-	for i := 0; i < 5; i++ {
-		if streamDone {
-			break
+	go func() {
+		for i := 0; i < 5; i++ {
+			if streamDone {
+				break
+			}
+			// 尝试退出 shell
+			_, _ = ptyRW.WriteString("exit\n")
+			<-time.After(time.Second)
 		}
-		// 尝试退出 shell
-		_, _ = inw.Write([]byte("exit\n"))
-		<-time.After(time.Second)
-	}
-	if !streamDone {
-		dLog.Error("stream did not exit successfully")
-	}
+		if !streamDone {
+			dLog.Error("stream did not exit successfully")
+		}
+	}()
 
 	dLog.Info("end ws connect")
 }
@@ -210,13 +220,6 @@ func serveHome(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, "home.html")
-}
-
-func init() {
-	format := new(log.TextFormatter)
-	format.FullTimestamp = true
-	format.TimestampFormat = "06-01-02 15:04:05"
-	log.SetFormatter(format)
 }
 
 func main() {
