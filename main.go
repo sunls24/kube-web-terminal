@@ -3,15 +3,14 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"io"
+	"k8s.io/client-go/tools/remotecommand"
 	command "kube-web-terminal/command"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -43,7 +42,7 @@ const (
 	msgResize  = '1'
 )
 
-func pumpStdin(ws *websocket.Conn, w io.Writer) {
+func pumpStdin(ws *websocket.Conn, w io.Writer, resize chan<- remotecommand.TerminalSize) {
 	ws.SetReadLimit(maxMessageSize)
 	_ = ws.SetReadDeadline(time.Now().Add(pongWait))
 	ws.SetPongHandler(func(string) error { _ = ws.SetReadDeadline(time.Now().Add(pongWait)); return nil })
@@ -56,25 +55,11 @@ func pumpStdin(ws *websocket.Conn, w io.Writer) {
 		case msgCommand:
 			message = message[1:]
 		case msgResize:
-			s := &command.Size{}
-			err = json.Unmarshal(message[1:], s)
-			if err != nil {
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: json.Unmarshal: %v", err)))
+			size := &command.Size{}
+			if err = json.Unmarshal(message[1:], size); err != nil {
 				continue
 			}
-
-			ptyRW := w.(*os.File)
-			size, err := pty.GetsizeFull(ptyRW)
-			if err != nil {
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: GetsizeFull: %v", err)))
-			}
-			size.Rows = s.Rows
-			size.Cols = s.Cols
-			err = pty.Setsize(ptyRW, size)
-			if err != nil {
-				_ = ws.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("resize: Setsize: %v", err)))
-			}
-			fmt.Println("resize done")
+			resize <- remotecommand.TerminalSize{Width: size.Cols, Height: size.Rows}
 			continue
 		default:
 			continue
@@ -124,10 +109,6 @@ func internalError(ws *websocket.Conn, err error) {
 	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 }
 
-func resize(ptyRW *os.File, cols, rows int) error {
-	return pty.Setsize(ptyRW, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-}
-
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func serveWs(w http.ResponseWriter, r *http.Request) {
@@ -166,22 +147,22 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	defer ttyRW.Close()
 	defer ptyRW.Close()
 
-	_ = pty.Setsize(ptyRW, &pty.Winsize{Cols: 35, Rows: 24})
-
 	cmd, err := command.NewCommand(ttyRW, []string{sh}, podName, namespace, container)
 	if err != nil {
 		internalError(ws, errors.Wrap(err, "NewCommand"))
 		return
 	}
 
+	resize := make(chan remotecommand.TerminalSize)
 	// stream 和 ws 有任意一个中断或结束，需要通知对方停止
 	quit := make(chan struct{})
 	var streamDone bool
 	go func() {
 		dLog.Info("stream start")
-		err := cmd.Stream(quit)
+		err := cmd.Stream(quit, resize)
 		dLog.Info("stream end, error: ", err)
 		streamDone = true
+
 		_ = ptyRW.Close() // 关闭使 pumpStdout 停止
 	}()
 
@@ -189,15 +170,16 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	go ping(ws, quit)
 
 	// ws 连接进行中会在此处堵塞
-	pumpStdin(ws, ptyRW)
+	pumpStdin(ws, ptyRW, resize)
 
 	close(quit)
+	close(resize)
 
 	go func() {
+		if streamDone {
+			return
+		}
 		for i := 0; i < 5; i++ {
-			if streamDone {
-				break
-			}
 			// 尝试退出 shell
 			_, _ = ptyRW.WriteString("exit\n")
 			<-time.After(time.Second)

@@ -43,7 +43,7 @@ func init() {
 }
 
 type Command interface {
-	Stream(quit <-chan struct{}) error
+	Stream(quit <-chan struct{}, resize <-chan remotecommand.TerminalSize) error
 }
 
 func NewCommand(ttyRW *os.File, command []string, podName, namespace, container string) (Command, error) {
@@ -75,15 +75,12 @@ type cmd struct {
 	exec remotecommand.Executor
 }
 
-func (c *cmd) Stream(quit <-chan struct{}) error {
-	sizeQueue := c.tty.MonitorSize(c.tty.GetSize())
+func (c *cmd) Stream(quit <-chan struct{}, resize <-chan remotecommand.TerminalSize) error {
+	initSize := <-resize
+	sizeQueue := c.tty.MonitorSize(resize, &initSize)
 	return c.tty.Safe(func() error {
 		return c.exec.Stream(remotecommand.StreamOptions{Stdout: c.tty.Out, Stderr: c.tty.Out, Stdin: c.tty.In, Tty: c.tty.Raw, TerminalSizeQueue: sizeQueue})
 	}, quit)
-}
-
-func (c *cmd) Resize(size Size) {
-	//c.tty.
 }
 
 type Size struct {

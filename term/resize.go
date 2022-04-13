@@ -47,7 +47,7 @@ func GetSize(fd uintptr) *remotecommand.TerminalSize {
 
 // MonitorSize monitors the terminal's size. It returns a TerminalSizeQueue primed with
 // initialSizes, or nil if there's no TTY present.
-func (t *TTY) MonitorSize(initialSizes ...*remotecommand.TerminalSize) remotecommand.TerminalSizeQueue {
+func (t *TTY) MonitorSize(resize <-chan remotecommand.TerminalSize, initialSizes ...*remotecommand.TerminalSize) remotecommand.TerminalSizeQueue {
 	outFd, isTerminal := term.GetFdInfo(t.Out)
 	if !isTerminal {
 		return nil
@@ -61,7 +61,7 @@ func (t *TTY) MonitorSize(initialSizes ...*remotecommand.TerminalSize) remotecom
 		stopResizing: make(chan struct{}),
 	}
 
-	t.sizeQueue.monitorSize(outFd, initialSizes...)
+	t.sizeQueue.monitorSize(outFd, resize, initialSizes...)
 
 	return t.sizeQueue
 }
@@ -79,7 +79,7 @@ var _ remotecommand.TerminalSizeQueue = &sizeQueue{}
 
 // monitorSize primes resizeChan with initialSizes and then monitors for resize events. With each
 // new event, it sends the current terminal size to resizeChan.
-func (s *sizeQueue) monitorSize(outFd uintptr, initialSizes ...*remotecommand.TerminalSize) {
+func (s *sizeQueue) monitorSize(outFd uintptr, resize <-chan remotecommand.TerminalSize, initialSizes ...*remotecommand.TerminalSize) {
 	// send the initial sizes
 	for i := range initialSizes {
 		if initialSizes[i] != nil {
@@ -87,17 +87,13 @@ func (s *sizeQueue) monitorSize(outFd uintptr, initialSizes ...*remotecommand.Te
 		}
 	}
 
-	resizeEvents := make(chan remotecommand.TerminalSize, 1)
-
-	monitorResizeEvents(outFd, resizeEvents, s.stopResizing)
-
 	// listen for resize events in the background
 	go func() {
 		defer runtime.HandleCrash()
 
 		for {
 			select {
-			case size, ok := <-resizeEvents:
+			case size, ok := <-resize:
 				if !ok {
 					return
 				}
