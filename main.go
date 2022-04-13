@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -11,6 +10,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	command "kube-web-terminal/command"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -138,16 +138,24 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	dLog := log.WithField("podName", podName).WithField("namespace", namespace).WithField("container", container).WithField("command", sh)
 	dLog.Info("start ws connect")
 
-	// websocket读写pty，exec程序读写tty
-	ptyRW, ttyRW, err := pty.Open()
+	// websocket读写outr/w，exec程序读写inr/w
+	outr, outw, err := os.Pipe()
 	if err != nil {
-		internalError(ws, errors.Wrap(err, "pty.Open"))
+		internalError(ws, errors.Wrap(err, "pipe stdout"))
 		return
 	}
-	defer ttyRW.Close()
-	defer ptyRW.Close()
+	defer outr.Close()
+	defer outw.Close()
 
-	cmd, err := command.NewCommand(ttyRW, []string{sh}, podName, namespace, container)
+	inr, inw, err := os.Pipe()
+	if err != nil {
+		internalError(ws, errors.Wrap(err, "pipe stdin"))
+		return
+	}
+	defer inr.Close()
+	defer inw.Close()
+
+	cmd, err := command.NewCommand(inr, outw, []string{sh}, podName, namespace, container)
 	if err != nil {
 		internalError(ws, errors.Wrap(err, "NewCommand"))
 		return
@@ -155,22 +163,21 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 
 	resize := make(chan remotecommand.TerminalSize)
 	// stream 和 ws 有任意一个中断或结束，需要通知对方停止
-	quit := make(chan struct{})
 	var streamDone bool
 	go func() {
 		dLog.Info("stream start")
-		err := cmd.Stream(quit, resize)
+		err := cmd.Stream(resize)
 		dLog.Info("stream end, error: ", err)
 		streamDone = true
-
-		_ = ptyRW.Close() // 关闭使 pumpStdout 停止
+		_ = outr.Close() // 关闭使 pumpStdout 停止
 	}()
 
-	go pumpStdout(ws, ptyRW)
+	quit := make(chan struct{})
+	go pumpStdout(ws, outr)
 	go ping(ws, quit)
 
 	// ws 连接进行中会在此处堵塞
-	pumpStdin(ws, ptyRW, resize)
+	pumpStdin(ws, inw, resize)
 
 	close(quit)
 	close(resize)
@@ -181,7 +188,7 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		}
 		for i := 0; i < 5; i++ {
 			// 尝试退出 shell
-			_, _ = ptyRW.WriteString("exit\n")
+			_, _ = inw.Write([]byte("exit\n"))
 			<-time.After(time.Second)
 		}
 		if !streamDone {

@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 	"github.com/pkg/errors"
+	"io"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -11,7 +12,6 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/homedir"
 	"kube-web-terminal/term"
-	"os"
 )
 
 var config *rest.Config
@@ -43,16 +43,13 @@ func init() {
 }
 
 type Command interface {
-	Stream(quit <-chan struct{}, resize <-chan remotecommand.TerminalSize) error
+	Stream(resize <-chan remotecommand.TerminalSize) error
 }
 
-func NewCommand(ttyRW *os.File, command []string, podName, namespace, container string) (Command, error) {
+func NewCommand(in io.Reader, out io.Writer, command []string, podName, namespace, container string) (Command, error) {
 	if config == nil || client == nil {
 		return nil, errors.New("config or client is nil")
 	}
-
-	tty := &term.TTY{In: ttyRW, Out: ttyRW}
-	tty.Raw = tty.IsTerminalIn()
 
 	req := client.CoreV1().RESTClient().Post().Resource("pods").
 		Name(podName).Namespace(namespace).SubResource("exec").
@@ -62,25 +59,24 @@ func NewCommand(ttyRW *os.File, command []string, podName, namespace, container 
 			Stdin:     true,
 			Stderr:    true,
 			Stdout:    true,
-			TTY:       tty.Raw}, scheme.ParameterCodec)
+			TTY:       true}, scheme.ParameterCodec)
 	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
 		return nil, errors.Wrap(err, "NewSPDYExecutor")
 	}
-	return &cmd{tty: tty, exec: exec}, nil
+	return &cmd{in: in, out: out, exec: exec}, nil
 }
 
 type cmd struct {
-	tty  *term.TTY
+	in   io.Reader
+	out  io.Writer
 	exec remotecommand.Executor
 }
 
-func (c *cmd) Stream(quit <-chan struct{}, resize <-chan remotecommand.TerminalSize) error {
+func (c *cmd) Stream(resize <-chan remotecommand.TerminalSize) error {
 	initSize := <-resize
-	sizeQueue := c.tty.MonitorSize(resize, &initSize)
-	return c.tty.Safe(func() error {
-		return c.exec.Stream(remotecommand.StreamOptions{Stdout: c.tty.Out, Stderr: c.tty.Out, Stdin: c.tty.In, Tty: c.tty.Raw, TerminalSizeQueue: sizeQueue})
-	}, quit)
+	sizeQueue := term.MonitorSize(resize, initSize)
+	return c.exec.Stream(remotecommand.StreamOptions{Stdout: c.out, Stderr: c.out, Stdin: c.in, Tty: true, TerminalSizeQueue: sizeQueue})
 }
 
 type Size struct {
