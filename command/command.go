@@ -74,7 +74,10 @@ type cmd struct {
 }
 
 func (c *cmd) Stream(resize <-chan remotecommand.TerminalSize) error {
-	initSize := <-resize
+	initSize, ok := <-resize
+	if !ok {
+		return errors.New("chan resize close, exit")
+	}
 	sizeQueue := term.MonitorSize(resize, initSize)
 	return c.exec.Stream(remotecommand.StreamOptions{Stdout: c.out, Stderr: c.out, Stdin: c.in, Tty: true, TerminalSizeQueue: sizeQueue})
 }

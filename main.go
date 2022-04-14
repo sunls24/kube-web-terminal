@@ -183,10 +183,10 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	close(resize)
 
 	go func() {
-		if streamDone {
-			return
-		}
 		for i := 0; i < 5; i++ {
+			if streamDone {
+				break
+			}
 			// 尝试退出 shell
 			_, _ = inw.Write([]byte("exit\n"))
 			<-time.After(time.Second)
