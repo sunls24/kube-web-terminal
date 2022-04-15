@@ -71,7 +71,7 @@ func pumpStdin(ws *websocket.Conn, w io.Writer, resize chan<- remotecommand.Term
 	}
 }
 
-func pumpStdout(ws *websocket.Conn, r io.Reader) {
+func pumpStdout(ws *Conn, r io.Reader) {
 	buff := make([]byte, 1024)
 	for {
 		n, err := r.Read(buff)
@@ -79,13 +79,13 @@ func pumpStdout(ws *websocket.Conn, r io.Reader) {
 			break
 		}
 		_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-		if err := ws.WriteMessage(websocket.TextMessage, buff[:n]); err != nil {
+		if err := ws.WriteSafe(websocket.TextMessage, buff[:n]); err != nil {
 			break
 		}
 	}
 
 	_ = ws.SetWriteDeadline(time.Now().Add(writeWait))
-	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	_ = ws.WriteSafe(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 }
 
 func ping(ws *websocket.Conn, quit chan struct{}) {
@@ -103,16 +103,14 @@ func ping(ws *websocket.Conn, quit chan struct{}) {
 	}
 }
 
-func internalError(ws *websocket.Conn, err error) {
+func internalError(ws *Conn, err error) {
 	err = errors.Wrap(err, "internal error")
 	log.Error(err)
-	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
+	_ = ws.WriteSafe(websocket.TextMessage, []byte(err.Error()))
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
 func serveWs(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
+	ws, err := Upgrade(w, r)
 	if err != nil {
 		log.Error(errors.Wrap(err, "upgrade ws"))
 		return
@@ -168,17 +166,17 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		streamDone = true
 		dLog.Info("stream end, error: ", err)
 		if err != nil {
-			_ = ws.WriteMessage(websocket.TextMessage, []byte(errors.Wrap(err, "stream error").Error()))
+			_ = ws.WriteSafe(websocket.TextMessage, []byte(errors.Wrap(err, "stream error").Error()))
 		}
 		_ = outr.Close() // 关闭使 pumpStdout 停止
 	})
 
 	quit := make(chan struct{})
 	go pumpStdout(ws, outr)
-	go ping(ws, quit)
+	go ping(ws.Conn, quit)
 
 	// ws 连接进行中会在此处堵塞
-	pumpStdin(ws, inw, resize)
+	pumpStdin(ws.Conn, inw, resize)
 
 	close(quit)
 	close(resize)
