@@ -104,7 +104,7 @@ func ping(ws *websocket.Conn, quit chan struct{}) {
 }
 
 func internalError(ws *websocket.Conn, err error) {
-	err = errors.Wrap(err, "internal server error")
+	err = errors.Wrap(err, "internal error")
 	log.Error(err)
 	_ = ws.WriteMessage(websocket.TextMessage, []byte(err.Error()))
 }
@@ -112,6 +112,13 @@ func internalError(ws *websocket.Conn, err error) {
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func serveWs(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Error(errors.Wrap(err, "upgrade ws"))
+		return
+	}
+	defer ws.Close()
+
 	podName := r.FormValue("podName")
 	namespace := r.FormValue("namespace")
 	container := r.FormValue("container")
@@ -120,20 +127,13 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 		sh = "sh"
 	}
 	if !strings.Contains(sh, "sh") {
-		log.Error("command needs to be an sh-like command")
+		internalError(ws, errors.New("command needs to be an sh-like command"))
 		return
 	}
 	if CheckEmpty(podName, namespace, container) {
-		log.Error("[podName, namespace, container] cannot be empty")
+		internalError(ws, errors.New("[podName, namespace, container] cannot be empty"))
 		return
 	}
-
-	ws, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Error(errors.Wrap(err, "upgrade ws"))
-		return
-	}
-	defer ws.Close()
 
 	dLog := log.WithField("podName", podName).WithField("namespace", namespace).WithField("container", container).WithField("command", sh)
 	dLog.Info("start ws connect")
@@ -164,13 +164,14 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 	resize := make(chan remotecommand.TerminalSize)
 	// stream 和 ws 有任意一个中断或结束，需要通知对方停止
 	var streamDone bool
-	go func() {
-		dLog.Info("stream start")
-		err := cmd.Stream(resize)
-		dLog.Info("stream end, error: ", err)
+	go cmd.Stream(resize, func(err error) {
 		streamDone = true
+		dLog.Info("stream end, error: ", err)
+		if err != nil {
+			_ = ws.WriteMessage(websocket.TextMessage, []byte(errors.Wrap(err, "stream error").Error()))
+		}
 		_ = outr.Close() // 关闭使 pumpStdout 停止
-	}()
+	})
 
 	quit := make(chan struct{})
 	go pumpStdout(ws, outr)
@@ -181,22 +182,20 @@ func serveWs(w http.ResponseWriter, r *http.Request) {
 
 	close(quit)
 	close(resize)
-
-	go func() {
-		for i := 0; i < 5; i++ {
-			if streamDone {
-				break
-			}
-			// 尝试退出 shell
-			_, _ = inw.Write([]byte("exit\n"))
-			<-time.After(time.Second)
-		}
-		if !streamDone {
-			dLog.Error("stream did not exit successfully")
-		}
-	}()
-
+	_ = ws.Close()
 	dLog.Info("end ws connect")
+
+	for i := 0; i < 5; i++ {
+		if streamDone {
+			return
+		}
+		// 尝试退出 shell
+		_, _ = inw.Write([]byte("exit\n"))
+		<-time.After(time.Second)
+	}
+	if !streamDone {
+		dLog.Error("stream did not exit successfully")
+	}
 }
 
 func serveHome(w http.ResponseWriter, r *http.Request) {

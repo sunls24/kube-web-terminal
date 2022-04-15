@@ -43,7 +43,7 @@ func init() {
 }
 
 type Command interface {
-	Stream(resize <-chan remotecommand.TerminalSize) error
+	Stream(resize <-chan remotecommand.TerminalSize, errHandle func(error))
 }
 
 func NewCommand(in io.Reader, out io.Writer, command []string, podName, namespace, container string) (Command, error) {
@@ -73,13 +73,14 @@ type cmd struct {
 	exec remotecommand.Executor
 }
 
-func (c *cmd) Stream(resize <-chan remotecommand.TerminalSize) error {
+func (c *cmd) Stream(resize <-chan remotecommand.TerminalSize, errHandler func(error)) {
 	initSize, ok := <-resize
 	if !ok {
-		return errors.New("chan resize close, exit")
+		errHandler(errors.New("resize is closed, stream not start"))
+		return
 	}
 	sizeQueue := term.MonitorSize(resize, initSize)
-	return c.exec.Stream(remotecommand.StreamOptions{Stdout: c.out, Stderr: c.out, Stdin: c.in, Tty: true, TerminalSizeQueue: sizeQueue})
+	errHandler(c.exec.Stream(remotecommand.StreamOptions{Stdout: c.out, Stderr: c.out, Stdin: c.in, Tty: true, TerminalSizeQueue: sizeQueue}))
 }
 
 type Size struct {
